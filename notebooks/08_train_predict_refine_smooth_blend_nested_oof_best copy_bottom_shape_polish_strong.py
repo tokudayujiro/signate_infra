@@ -859,6 +859,150 @@ test_pred_final = apply_final_postprocess(
     method_name=final_method,
 )
 
+# %%
+# 最終予測の局所的な歪みを少しだけ丸める。
+POLISH_SMOOTH_LAMBDA_CANDIDATES = (10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0)
+POLISH_BLEND_RATIO_CANDIDATES = (0.5, 0.75, 0.9, 1.0)
+POLISH_SPACE_CANDIDATES = ("log", "linear")
+POLISH_EXTRA_PASSES_CANDIDATES = (1, 2, 3)
+POLISH_RMSE_TOLERANCE = 0.30
+
+
+def apply_shape_polish(
+    predictions: np.ndarray,
+    group_keys: pd.Series,
+    smooth_lambda: float,
+    blend_ratio: float,
+    space: str,
+    extra_passes: int,
+) -> np.ndarray:
+    """最終予測を強めに滑らかへ寄せて局所的なガックンを減らす。"""
+    base = np.clip(np.asarray(predictions, dtype=float).reshape(-1), PREDICTION_LOWER_BOUND, None)
+    if blend_ratio <= 0.0:
+        return base.copy()
+
+    if space == "linear":
+        smooth = base.copy()
+        for _ in range(max(int(extra_passes), 1)):
+            smooth = apply_groupwise_monotone_smooth(smooth, group_keys, smooth_lambda)
+    elif space == "log":
+        log_base = np.log1p(base)
+        smooth_log = log_base.copy()
+        for _ in range(max(int(extra_passes), 1)):
+            smooth_log = apply_groupwise_monotone_smooth(smooth_log, group_keys, smooth_lambda)
+        smooth = np.expm1(smooth_log)
+    else:
+        raise ValueError(f"Unsupported polish space: {space}")
+
+    polished = (1.0 - blend_ratio) * base + blend_ratio * smooth
+    polished = np.clip(polished, PREDICTION_LOWER_BOUND, None)
+    polished = apply_groupwise_cummin(polished, group_keys)
+    if extra_passes >= 2:
+        polished = apply_groupwise_monotone_smooth(polished, group_keys, max(smooth_lambda * 0.5, 1e-8))
+        polished = apply_groupwise_cummin(polished, group_keys)
+    return polished
+
+
+def compute_groupwise_roughness(predictions: np.ndarray, group_keys: pd.Series) -> dict[str, float]:
+    """見た目のガックンを測るために 2 階差分の大きさを測る。"""
+    pred = np.asarray(predictions, dtype=float).reshape(-1)
+    mean_abs_second_diff_list: list[float] = []
+    max_abs_second_diff_list: list[float] = []
+
+    for group_idx in iter_group_indices(group_keys):
+        group_pred = pred[group_idx]
+        if len(group_pred) <= 2:
+            continue
+        scale = max(float(group_pred[0] - group_pred[-1]), 1e-8)
+        second_diff = np.diff(group_pred, n=2) / scale
+        mean_abs_second_diff_list.append(float(np.mean(np.abs(second_diff))))
+        max_abs_second_diff_list.append(float(np.max(np.abs(second_diff))))
+
+    if not mean_abs_second_diff_list:
+        return {"roughness_mean": 0.0, "roughness_max": 0.0}
+    return {
+        "roughness_mean": float(np.mean(mean_abs_second_diff_list)),
+        "roughness_max": float(np.mean(max_abs_second_diff_list)),
+    }
+
+
+def select_best_shape_polish(
+    predictions: np.ndarray,
+    y_true: np.ndarray,
+    group_keys: pd.Series,
+) -> tuple[dict[str, float | str], np.ndarray, dict[str, float]]:
+    """RMSE を大きく悪化させない範囲で、最も滑らかな shape polish を選ぶ。"""
+    base = np.clip(np.asarray(predictions, dtype=float).reshape(-1), PREDICTION_LOWER_BOUND, None)
+    candidates = {"none": base}
+    base_roughness = compute_groupwise_roughness(base, group_keys)
+    configs = {
+        "none": {
+            "name": "none",
+            "smooth_lambda": 0.0,
+            "blend_ratio": 0.0,
+            "space": "linear",
+            "extra_passes": 0.0,
+            "roughness_mean": float(base_roughness["roughness_mean"]),
+            "roughness_max": float(base_roughness["roughness_max"]),
+        }
+    }
+
+    for space in POLISH_SPACE_CANDIDATES:
+        for smooth_lambda in POLISH_SMOOTH_LAMBDA_CANDIDATES:
+            for blend_ratio in POLISH_BLEND_RATIO_CANDIDATES:
+                for extra_passes in POLISH_EXTRA_PASSES_CANDIDATES:
+                    name = f"polish_{space}_l{smooth_lambda:g}_r{blend_ratio:g}_p{extra_passes}"
+                    candidates[name] = apply_shape_polish(
+                        predictions,
+                        group_keys=group_keys,
+                        smooth_lambda=smooth_lambda,
+                        blend_ratio=blend_ratio,
+                        space=space,
+                        extra_passes=extra_passes,
+                    )
+                    roughness = compute_groupwise_roughness(candidates[name], group_keys)
+                    configs[name] = {
+                        "name": name,
+                        "smooth_lambda": float(smooth_lambda),
+                        "blend_ratio": float(blend_ratio),
+                        "space": space,
+                        "extra_passes": float(extra_passes),
+                        "roughness_mean": float(roughness["roughness_mean"]),
+                        "roughness_max": float(roughness["roughness_max"]),
+                    }
+
+    scores = {name: compute_rmse(y_true, pred) for name, pred in candidates.items()}
+    best_rmse = min(scores.values())
+    eligible_names = [
+        name for name, rmse in scores.items() if rmse <= best_rmse + POLISH_RMSE_TOLERANCE
+    ]
+    best_name = min(
+        eligible_names,
+        key=lambda name: (
+            float(configs[name]["roughness_max"]),
+            float(configs[name]["roughness_mean"]),
+            -float(configs[name]["blend_ratio"]),
+            -float(configs[name]["extra_passes"]),
+            float(scores[name]),
+        ),
+    )
+    return configs[best_name], candidates[best_name], scores
+
+
+polish_config, train_pred_polished, polish_scores = select_best_shape_polish(
+    train_pred_final,
+    y_true=y_train_array,
+    group_keys=train_meta_df["group_key"],
+)
+test_pred_polished = apply_shape_polish(
+    test_pred_final,
+    group_keys=test_meta_df["group_key"],
+    smooth_lambda=float(polish_config["smooth_lambda"]),
+    blend_ratio=float(polish_config["blend_ratio"]),
+    space=str(polish_config["space"]),
+    extra_passes=int(float(polish_config["extra_passes"])),
+)
+
 fold_summary_df = pd.DataFrame(fold_rows)
 print(fold_summary_df)
 
@@ -873,29 +1017,44 @@ train_backward_rmse = compute_rmse(y_train_array, train_pred_backward)
 train_smooth_rmse = compute_rmse(y_train_array, train_pred_smooth)
 train_blend_raw_rmse = compute_rmse(y_train_array, train_pred_blend_raw)
 train_final_rmse = compute_rmse(y_train_array, train_pred_final)
+train_polished_rmse = compute_rmse(y_train_array, train_pred_polished)
 print(
     f"Train RMSE raw={train_raw_rmse:.4f}, backward={train_backward_rmse:.4f}, "
-    f"smooth={train_smooth_rmse:.4f}, blend_raw={train_blend_raw_rmse:.4f}, final={train_final_rmse:.4f}"
+    f"smooth={train_smooth_rmse:.4f}, blend_raw={train_blend_raw_rmse:.4f}, "
+    f"final={train_final_rmse:.4f}, polished={train_polished_rmse:.4f}"
 )
 print("Final postprocess RMSE:", {k: round(v, 4) for k, v in final_scores.items()})
+print("Shape polish RMSE:", {k: round(v, 4) for k, v in polish_scores.items()})
+print(
+    f"Selected shape polish: {str(polish_config['name'])} "
+    f"(smooth_lambda={float(polish_config['smooth_lambda']):g}, "
+    f"blend_ratio={float(polish_config['blend_ratio']):g}, "
+    f"space={str(polish_config['space'])}, "
+    f"extra_passes={int(float(polish_config['extra_passes']))}, "
+    f"roughness_mean={float(polish_config['roughness_mean']):.4f}, "
+    f"roughness_max={float(polish_config['roughness_max']):.4f})"
+)
 
 # 単調性違反がどれだけ減ったかも確認する。
 train_raw_violations = count_monotonic_violations(train_pred_raw, train_meta_df["group_key"])
 train_blend_raw_violations = count_monotonic_violations(train_pred_blend_raw, train_meta_df["group_key"])
 train_final_violations = count_monotonic_violations(train_pred_final, train_meta_df["group_key"])
+train_polished_violations = count_monotonic_violations(train_pred_polished, train_meta_df["group_key"])
 test_raw_violations = count_monotonic_violations(test_pred_raw, test_meta_df["group_key"])
 test_blend_raw_violations = count_monotonic_violations(test_pred_blend_raw, test_meta_df["group_key"])
 test_final_violations = count_monotonic_violations(test_pred_final, test_meta_df["group_key"])
+test_polished_violations = count_monotonic_violations(test_pred_polished, test_meta_df["group_key"])
 print(
     f"Violations train raw={train_raw_violations}, train blend_raw={train_blend_raw_violations}, "
-    f"train final={train_final_violations}, test raw={test_raw_violations}, "
-    f"test blend_raw={test_blend_raw_violations}, test final={test_final_violations}"
+    f"train final={train_final_violations}, train polished={train_polished_violations}, "
+    f"test raw={test_raw_violations}, test blend_raw={test_blend_raw_violations}, "
+    f"test final={test_final_violations}, test polished={test_polished_violations}"
 )
 
 # 提出用 CSV と詳細ログを保存する。
-submit_df = build_submit_df(test_ids, test_pred_final)
-rmse_tag = int(round(train_final_rmse * 10000))
-submit_path = os.path.join(SUBMIT_DIR, f"submit_csv_08_refine_smooth_blend_nested_oof_{DATE}_{rmse_tag:04d}.csv")
+submit_df = build_submit_df(test_ids, test_pred_polished)
+rmse_tag = int(round(train_polished_rmse * 10000))
+submit_path = os.path.join(SUBMIT_DIR, f"submit_csv_08_refine_smooth_blend_nested_oof_shape_polish_strong_{DATE}_{rmse_tag:04d}.csv")
 submit_df.to_csv(submit_path, index=False, header=False, encoding="utf-8-sig")
 print(f"saved: {submit_path}")
 
@@ -910,13 +1069,21 @@ detail_df = pd.DataFrame(
         "blend_weight_pred": test_weight_pred,
         "blend_raw_prediction": test_pred_blend_raw,
         "final_prediction": test_pred_final,
+        "polished_prediction": test_pred_polished,
         "final_method": final_method,
+        "shape_polish_name": str(polish_config["name"]),
+        "shape_polish_smooth_lambda": float(polish_config["smooth_lambda"]),
+        "shape_polish_blend_ratio": float(polish_config["blend_ratio"]),
+        "shape_polish_space": str(polish_config["space"]),
+        "shape_polish_extra_passes": int(float(polish_config["extra_passes"])),
+        "shape_polish_roughness_mean": float(polish_config["roughness_mean"]),
+        "shape_polish_roughness_max": float(polish_config["roughness_max"]),
         "smooth_lambda_choices": summarize_choice_counts(smooth_lambda_choices),
     }
 )
-detail_path = os.path.join(SUBMIT_DIR, f"test_prediction_detail_08_refine_smooth_blend_nested_oof_{DATE}.csv")
+detail_path = os.path.join(SUBMIT_DIR, f"test_prediction_detail_08_refine_smooth_blend_nested_oof_shape_polish_strong_{DATE}.csv")
 detail_df.to_csv(detail_path, index=False, encoding="utf-8-sig")
-fold_summary_path = os.path.join(SUBMIT_DIR, f"fold_summary_08_refine_smooth_blend_nested_oof_{DATE}.csv")
+fold_summary_path = os.path.join(SUBMIT_DIR, f"fold_summary_08_refine_smooth_blend_nested_oof_shape_polish_strong_{DATE}.csv")
 fold_summary_df.to_csv(fold_summary_path, index=False, encoding="utf-8-sig")
 
 submit_df.head()
@@ -924,20 +1091,20 @@ submit_df.head()
 
 # %%
 # 仕上がり確認用の可視化。
-plot_raw_vs_final(train_meta_df, train_pred_raw, train_pred_final, "Train", final_method)
-plot_raw_vs_final(test_meta_df, test_pred_raw, test_pred_final, "Test", final_method)
+plot_raw_vs_final(train_meta_df, train_pred_final, train_pred_polished, "Train", str(polish_config["name"]))
+plot_raw_vs_final(test_meta_df, test_pred_final, test_pred_polished, "Test", str(polish_config["name"]))
 plot_prediction_trend_by_species(
     train_meta_df,
-    train_pred_final,
-    f"学習データ: 樹種ごとの予測含水率の推移 ({final_method})",
+    train_pred_polished,
+    f"学習データ: 樹種ごとの予測含水率の推移 (shape polish strong)",
 )
 plot_prediction_trend_by_species(
     test_meta_df,
-    test_pred_final,
-    f"テストデータ: 樹種ごとの予測含水率の推移 ({final_method})",
+    test_pred_polished,
+    f"テストデータ: 樹種ごとの予測含水率の推移 (shape polish strong)",
 )
 # %%
-test_pred_final
+test_pred_polished
 # %%
 submit_df
 # %%
