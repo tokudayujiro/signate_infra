@@ -1,0 +1,811 @@
+# %%
+from __future__ import annotations
+
+import json
+import warnings
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import mlflow
+import numpy as np
+import optuna
+import pandas as pd
+import seaborn as sns
+from scipy.signal import savgol_filter
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.metrics import make_scorer, mean_squared_error
+from sklearn.model_selection import GroupKFold, KFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+try:
+    import japanize_matplotlib  # noqa: F401
+except ImportError:
+    japanize_matplotlib = None
+
+# ============================================================
+# SIGNATE 木材含水率コンペ向け GroupKFold 対応版
+# - species number を使って同一樹種が train/valid にまたがらないよう評価
+# - 樹種列が無い/グループ数不足なら自動で KFold にフォールバック
+# - PLS を主軸、Ridge を比較対象として保持
+# - 前処理: Raw / SNV / MSC / Savitzky-Golay 微分
+# - 帯域: full と水分吸収帯を比較
+# - MLflow / Optuna 対応
+# ============================================================
+
+# --- 設定（必要に応じて編集） ---
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = (BASE_DIR / ".." / "data").resolve()
+SUBMIT_DIR = DATA_DIR
+MLRUNS_DIR = (BASE_DIR / ".." / "mlruns").resolve()
+
+TRAIN_PATH = DATA_DIR / "train.csv"
+TEST_PATH = DATA_DIR / "test.csv"
+
+TARGET_COL = "含水率"
+ID_COL = "sample number"
+JST = timezone(timedelta(hours=9))
+DATE = datetime.now(JST).strftime("%Y%m%d%H%M")
+EXPERIMENT_NAME = "spectral_moisture_pls_groupkfold_optuna"
+PREPROCESS_CLIP_NEGATIVE = False
+PREPROCESS_DROP_SPECIES: list[str] = []
+RANDOM_STATE = 42
+N_TRIALS = 80
+CV = 5
+ENCODING = "cp932"
+
+# auto: 樹種列があれば GroupKFold、なければ KFold
+# group: 可能なら GroupKFold を優先、無理なら警告付きで KFold
+# kfold: 常に KFold
+CV_STRATEGY = "group"
+
+# SG filter 候補
+SG_WINDOW_CANDIDATES = [9, 11, 15, 21]
+SG_POLYORDER = 2
+MAX_PLS_COMPONENTS = 40
+MIN_BAND_COLS = 30
+FIGURE_DPI = 150
+NIR_BAND_ANNOTATIONS = [
+    (4300.0, "Cellulose/Hemicellulose (O-H)"),
+    (5200.0, "Water (O-H)"),
+    (5800.0, "C-H first overtone"),
+    (6900.0, "Water (O-H) first overtone"),
+    (8400.0, "Cellulose/Lignin (O-H) second overtone"),
+]
+
+
+# ============================================================
+# Utility
+# ============================================================
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def neg_rmse_scorer():
+    return make_scorer(
+        lambda y_true, y_pred: -np.sqrt(mean_squared_error(y_true, y_pred)),
+        greater_is_better=True,
+    )
+
+
+def parse_wavelength(col_name: str) -> float | None:
+    try:
+        val = float(str(col_name))
+    except (TypeError, ValueError):
+        return None
+    if 300 <= val <= 3000:
+        return val
+    return None
+
+
+def infer_species_col(df: pd.DataFrame) -> str | None:
+    candidates = ["樹種", "species", "species number"]
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def find_wavelength_cols(train_df: pd.DataFrame, test_df: pd.DataFrame, species_col: str | None) -> list[str]:
+    exclude = {ID_COL, TARGET_COL, "乾物率"}
+    if species_col is not None:
+        exclude.add(species_col)
+
+    cols: list[str] = []
+    for col in train_df.columns:
+        if col in exclude or col not in test_df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(train_df[col]):
+            continue
+        wl = parse_wavelength(col)
+        if wl is not None:
+            cols.append(col)
+
+    # SG 微分の前提なので必ず波長順でソート
+    cols = sorted(cols, key=lambda x: float(x))
+    return cols
+
+
+def fallback_numeric_feature_cols(train_df: pd.DataFrame, test_df: pd.DataFrame, species_col: str | None) -> list[str]:
+    exclude = {ID_COL, TARGET_COL, "乾物率"}
+    if species_col is not None:
+        exclude.add(species_col)
+
+    cols = [
+        c
+        for c in train_df.columns
+        if c in test_df.columns and c not in exclude and pd.api.types.is_numeric_dtype(train_df[c])
+    ]
+    return cols
+
+
+def build_band_map(spectral_cols: list[str]) -> tuple[dict[str, tuple[float, float] | None], dict[str, float]]:
+    wavelength_map = {c: float(c) for c in spectral_cols if parse_wavelength(c) is not None}
+
+    band_map: dict[str, tuple[float, float] | None] = {"full": None}
+    candidate_bands = {
+        "water_1400_1470": (1400.0, 1470.0),
+        "water_1800_2050": (1800.0, 2050.0),
+        "water_1400_2050": (1400.0, 2050.0),
+        "water_1400_1900": (1400.0, 1900.0),
+    }
+
+    for name, (lo, hi) in candidate_bands.items():
+        band_cols = [c for c in spectral_cols if c in wavelength_map and lo <= wavelength_map[c] <= hi]
+        if len(band_cols) >= MIN_BAND_COLS:
+            band_map[name] = (lo, hi)
+
+    return band_map, wavelength_map
+
+
+def choose_band_cols(
+    spectral_cols: list[str],
+    wavelength_map: dict[str, float],
+    band: tuple[float, float] | None,
+) -> list[str]:
+    if band is None:
+        return spectral_cols
+    lo, hi = band
+    band_cols = [c for c in spectral_cols if c in wavelength_map and lo <= wavelength_map[c] <= hi]
+    if len(band_cols) < MIN_BAND_COLS:
+        return spectral_cols
+    return band_cols
+
+
+def build_cv_splits(
+    train_df: pd.DataFrame,
+    y_train: np.ndarray,
+    species_col: str | None,
+    cv: int,
+    cv_strategy: str,
+    random_state: int,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], str, int]:
+    """
+    事前に split を固定しておくことで、Optuna 中の各 trial で同一分割を使う。
+    戻り値: (splits, splitter_name, n_unique_groups)
+    """
+    use_group = False
+    n_unique_groups = 0
+
+    if species_col is not None:
+        groups = train_df[species_col]
+        n_unique_groups = int(groups.nunique(dropna=True))
+        if n_unique_groups >= cv and cv_strategy in {"auto", "group"}:
+            use_group = True
+
+    if use_group:
+        splitter = GroupKFold(n_splits=cv)
+        splits = list(splitter.split(train_df, y_train, groups=train_df[species_col]))
+        return splits, "GroupKFold", n_unique_groups
+
+    if cv_strategy == "group" and species_col is not None and n_unique_groups < cv:
+        print(
+            f"[WARN] species number のユニーク数が {n_unique_groups} しかないため "
+            f"GroupKFold(n_splits={cv}) を組めません。KFold にフォールバックします。"
+        )
+
+    splitter = KFold(n_splits=cv, shuffle=True, random_state=random_state)
+    splits = list(splitter.split(train_df, y_train))
+    return splits, "KFold", n_unique_groups
+
+
+def min_train_size_from_splits(splits: list[tuple[np.ndarray, np.ndarray]]) -> int:
+    return min(len(tr_idx) for tr_idx, _ in splits)
+
+
+def numeric_axis_cols(feature_cols: list[str]) -> tuple[list[str], np.ndarray]:
+    axis_pairs: list[tuple[float, str]] = []
+    for col in feature_cols:
+        try:
+            axis_pairs.append((float(str(col)), col))
+        except (TypeError, ValueError):
+            continue
+
+    axis_pairs.sort(key=lambda pair: pair[0])
+    ordered_cols = [col for _, col in axis_pairs]
+    axis_values = np.asarray([axis for axis, _ in axis_pairs], dtype=float)
+    return ordered_cols, axis_values
+
+
+def save_figure(fig: plt.Figure, save_path: Path) -> Path:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved figure: {save_path}")
+    return save_path
+
+
+def plot_mean_spectrum_by_species(
+    train_df: pd.DataFrame,
+    species_col: str | None,
+    spectral_cols: list[str],
+    save_dir: Path,
+) -> Path | None:
+    if species_col is None or species_col not in train_df.columns:
+        return None
+
+    plot_cols, axis_values = numeric_axis_cols(spectral_cols)
+    if len(plot_cols) < 2:
+        return None
+
+    mean_spectra = train_df.groupby(species_col)[plot_cols].mean().T
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    for species in mean_spectra.columns:
+        ax.plot(
+            axis_values,
+            mean_spectra[species].to_numpy(dtype=float),
+            linewidth=1.5,
+            alpha=0.9,
+            label=str(species),
+        )
+
+    axis_label = "Wavenumber" if float(axis_values.max()) > 3000 else "Wavelength"
+    ax.set_xlabel(axis_label)
+    ax.set_ylabel("Mean absorbance")
+    ax.set_title(f"Mean spectrum by {species_col}")
+
+    y_min = float(np.nanmin(mean_spectra.to_numpy(dtype=float)))
+    y_max = float(np.nanmax(mean_spectra.to_numpy(dtype=float)))
+    y_text = y_min + (y_max - y_min) * 0.03 if y_max > y_min else y_min
+    note_lines: list[str] = []
+
+    for x_band, label in NIR_BAND_ANNOTATIONS:
+        if float(axis_values.min()) <= x_band <= float(axis_values.max()):
+            ax.axvline(x=x_band, color="gray", linestyle="--", linewidth=0.9, alpha=0.6)
+            ax.text(
+                x_band + 15,
+                y_text,
+                str(int(x_band)),
+                rotation=90,
+                va="bottom",
+                ha="left",
+                fontsize=8,
+                color="dimgray",
+                clip_on=True,
+            )
+            note_lines.append(f"{int(x_band)}: {label}")
+
+    if note_lines:
+        ax.text(
+            0.02,
+            0.02,
+            "Major absorptions\n" + "\n".join(note_lines),
+            transform=ax.transAxes,
+            va="bottom",
+            ha="left",
+            fontsize=8.5,
+            color="dimgray",
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.9, "edgecolor": "lightgray"},
+        )
+
+    ax.legend(title=species_col, bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout(rect=[0, 0, 0.82, 1])
+    return save_figure(fig, save_dir / "train_mean_spectrum_by_species.png")
+
+
+def plot_target_trend_by_species(
+    train_df: pd.DataFrame,
+    species_col: str | None,
+    target_col: str,
+    save_dir: Path,
+) -> Path | None:
+    if species_col is None or species_col not in train_df.columns or target_col not in train_df.columns:
+        return None
+
+    plot_df = train_df[[species_col, target_col]].copy()
+    plot_df["sample_order_in_species"] = plot_df.groupby(species_col).cumcount() + 1
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    sns.lineplot(
+        data=plot_df,
+        x="sample_order_in_species",
+        y=target_col,
+        hue=species_col,
+        marker="o",
+        linewidth=1.5,
+        alpha=0.9,
+        ax=ax,
+    )
+    ax.set_xlabel(f"Sample order within {species_col}")
+    ax.set_ylabel(target_col)
+    ax.set_title(f"Observed {target_col} by {species_col}")
+    ax.legend(title=species_col, bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    return save_figure(fig, save_dir / "train_actual_target_trend_by_species.png")
+
+
+def plot_sample_count_by_species(
+    df: pd.DataFrame,
+    species_col: str | None,
+    split_name: str,
+    save_dir: Path,
+) -> Path | None:
+    if species_col is None or species_col not in df.columns:
+        return None
+
+    species_series = df[species_col].astype(str).fillna("NA")
+    species_order = species_series.value_counts().index
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    sns.countplot(x=species_series, order=species_order, ax=ax)
+    ax.set_title(f"{split_name.capitalize()} sample count by {species_col}")
+    ax.set_xlabel(species_col)
+    ax.set_ylabel("Count")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    return save_figure(fig, save_dir / f"{split_name}_sample_count_by_species.png")
+
+
+def plot_predicted_box_by_species(
+    df: pd.DataFrame,
+    predictions: np.ndarray,
+    species_col: str | None,
+    split_name: str,
+    save_dir: Path,
+) -> Path | None:
+    if species_col is None or species_col not in df.columns:
+        return None
+
+    plot_df = pd.DataFrame(
+        {
+            "species": df[species_col].astype(str).fillna("NA"),
+            "predicted_target": np.asarray(predictions, dtype=float).reshape(-1),
+        }
+    )
+    order = plot_df.groupby("species")["predicted_target"].median().sort_values().index
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    sns.boxplot(data=plot_df, x="species", y="predicted_target", order=order, ax=ax)
+    ax.set_title(f"{split_name.capitalize()} predicted {TARGET_COL} by {species_col}")
+    ax.set_xlabel(species_col)
+    ax.set_ylabel(f"Predicted {TARGET_COL}")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    return save_figure(fig, save_dir / f"{split_name}_predicted_target_box_by_species.png")
+
+
+def plot_predicted_trend_by_species(
+    df: pd.DataFrame,
+    predictions: np.ndarray,
+    species_col: str | None,
+    split_name: str,
+    save_dir: Path,
+) -> Path | None:
+    if species_col is None or species_col not in df.columns:
+        return None
+
+    plot_df = pd.DataFrame(
+        {
+            "species": df[species_col].astype(str).fillna("NA"),
+            "predicted_target": np.asarray(predictions, dtype=float).reshape(-1),
+        }
+    )
+    plot_df["sample_order_in_species"] = plot_df.groupby("species").cumcount() + 1
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    sns.lineplot(
+        data=plot_df,
+        x="sample_order_in_species",
+        y="predicted_target",
+        hue="species",
+        marker="o",
+        linewidth=1.2,
+        alpha=0.85,
+        ax=ax,
+    )
+    ax.set_xlabel("Sample order within species")
+    ax.set_ylabel(f"Predicted {TARGET_COL}")
+    ax.set_title(f"{split_name.capitalize()} predicted {TARGET_COL} trend by species")
+    ax.legend(title=species_col, bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    return save_figure(fig, save_dir / f"{split_name}_predicted_target_trend_by_species.png")
+
+
+def create_visualizations(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    spectral_cols: list[str],
+    target_col: str,
+    species_col: str | None,
+    train_pred: np.ndarray,
+    test_pred: np.ndarray,
+    save_dir: Path,
+) -> list[Path]:
+    sns.set_theme(style="whitegrid")
+
+    paths: list[Path] = []
+    for maybe_path in [
+        plot_mean_spectrum_by_species(train_df, species_col, spectral_cols, save_dir),
+        plot_target_trend_by_species(train_df, species_col, target_col, save_dir),
+        plot_sample_count_by_species(train_df, species_col, "train", save_dir),
+        plot_predicted_box_by_species(train_df, train_pred, species_col, "train", save_dir),
+        plot_predicted_trend_by_species(train_df, train_pred, species_col, "train", save_dir),
+        plot_sample_count_by_species(test_df, species_col, "test", save_dir),
+        plot_predicted_box_by_species(test_df, test_pred, species_col, "test", save_dir),
+        plot_predicted_trend_by_species(test_df, test_pred, species_col, "test", save_dir),
+    ]:
+        if maybe_path is not None:
+            paths.append(maybe_path)
+
+    return paths
+
+
+# ============================================================
+# Custom Transformers
+# ============================================================
+class ColumnSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, cols: list[str]):
+        self.cols = cols
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if isinstance(X, pd.DataFrame):
+            return X.loc[:, self.cols].to_numpy(dtype=float)
+        return np.asarray(X, dtype=float)
+
+
+class SNVTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        row_mean = X.mean(axis=1, keepdims=True)
+        row_std = X.std(axis=1, keepdims=True)
+        row_std = np.where(row_std < 1e-12, 1.0, row_std)
+        return (X - row_mean) / row_std
+
+
+class MSCTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=float)
+        self.reference_ = X.mean(axis=0)
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        ref = self.reference_
+        X_corr = np.zeros_like(X)
+
+        for i in range(X.shape[0]):
+            slope, intercept = np.polyfit(ref, X[i], deg=1)
+            if abs(slope) < 1e-12:
+                slope = 1.0
+            X_corr[i] = (X[i] - intercept) / slope
+        return X_corr
+
+
+class SavitzkyGolayTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, window_length: int = 15, polyorder: int = 2, deriv: int = 1):
+        self.window_length = window_length
+        self.polyorder = polyorder
+        self.deriv = deriv
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        n_features = X.shape[1]
+        if n_features < 3:
+            return X
+
+        window = min(self.window_length, n_features if n_features % 2 == 1 else n_features - 1)
+        if window <= self.polyorder or window < 3:
+            return X
+
+        return savgol_filter(
+            X,
+            window_length=window,
+            polyorder=self.polyorder,
+            deriv=self.deriv,
+            axis=1,
+        )
+
+
+# ============================================================
+# Model Builder
+# ============================================================
+def build_pipeline(
+    spectral_cols: list[str],
+    wavelength_map: dict[str, float],
+    params: dict,
+) -> tuple[Pipeline, list[str]]:
+    band = BAND_MAP[params["band_name"]]
+    cols = choose_band_cols(spectral_cols, wavelength_map, band)
+
+    steps: list[tuple[str, object]] = [
+        ("select", ColumnSelector(cols)),
+        ("impute", SimpleImputer(strategy="median")),
+    ]
+
+    preproc = params["preproc"]
+    if preproc == "snv":
+        steps.append(("snv", SNVTransformer()))
+    elif preproc == "msc":
+        steps.append(("msc", MSCTransformer()))
+
+    deriv = params["deriv"]
+    if deriv > 0:
+        steps.append(
+            (
+                "sg",
+                SavitzkyGolayTransformer(
+                    window_length=params["sg_window"],
+                    polyorder=SG_POLYORDER,
+                    deriv=deriv,
+                ),
+            )
+        )
+
+    model_type = params["model_type"]
+    if model_type == "pls":
+        n_components = max(1, min(int(params["n_components"]), len(cols) - 1))
+        steps.append(("scale", StandardScaler(with_mean=True, with_std=True)))
+        steps.append(("model", PLSRegression(n_components=n_components, scale=False)))
+    elif model_type == "ridge":
+        steps.append(("scale", StandardScaler(with_mean=True, with_std=True)))
+        steps.append(("model", Ridge(alpha=float(params["alpha"]), random_state=RANDOM_STATE)))
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    return Pipeline(steps), cols
+
+
+# ============================================================
+# Optuna Objective
+# ============================================================
+def suggest_params(trial: optuna.Trial) -> dict:
+    model_type = trial.suggest_categorical("model_type", ["pls", "ridge"])
+    preproc = trial.suggest_categorical("preproc", ["none", "snv", "msc"])
+    deriv = trial.suggest_categorical("deriv", [0, 1, 2])
+    band_name = trial.suggest_categorical("band_name", list(BAND_MAP.keys()))
+
+    params: dict = {
+        "model_type": model_type,
+        "preproc": preproc,
+        "deriv": deriv,
+        "band_name": band_name,
+        "sg_window": 0,
+    }
+
+    if deriv > 0:
+        params["sg_window"] = trial.suggest_categorical("sg_window", SG_WINDOW_CANDIDATES)
+
+    if model_type == "pls":
+        selected_cols = choose_band_cols(SPECTRAL_COLS, WAVELENGTH_MAP, BAND_MAP[band_name])
+        upper = max(2, min(MAX_PLS_COMPONENTS, len(selected_cols) - 1, MIN_TRAIN_SIZE_IN_CV - 1))
+        params["n_components"] = trial.suggest_int("n_components", 2, upper)
+        params["alpha"] = 0.0
+    else:
+        params["alpha"] = trial.suggest_float("alpha", 1e-3, 1e4, log=True)
+        params["n_components"] = 0
+
+    return params
+
+
+def objective(trial: optuna.Trial) -> float:
+    params = suggest_params(trial)
+    model, used_cols = build_pipeline(SPECTRAL_COLS, WAVELENGTH_MAP, params)
+
+    scores = cross_val_score(
+        model,
+        TRAIN_DF,
+        Y_TRAIN,
+        cv=CV_SPLITS,
+        scoring=neg_rmse_scorer(),
+        error_score="raise",
+    )
+
+    score = float(-scores.mean())
+    trial.set_user_attr("n_features", len(used_cols))
+    trial.set_user_attr("params_json", json.dumps(params, ensure_ascii=False))
+    return score
+
+
+# ============================================================
+# Main
+# ============================================================
+TRAIN_DF: pd.DataFrame
+TEST_DF: pd.DataFrame
+Y_TRAIN: np.ndarray
+SPECTRAL_COLS: list[str]
+BAND_MAP: dict[str, tuple[float, float] | None]
+WAVELENGTH_MAP: dict[str, float]
+CV_SPLITS: list[tuple[np.ndarray, np.ndarray]]
+MIN_TRAIN_SIZE_IN_CV: int
+SPLITTER_NAME: str
+GROUP_COUNT: int
+
+
+def main() -> None:
+    global TRAIN_DF, TEST_DF, Y_TRAIN, SPECTRAL_COLS, BAND_MAP, WAVELENGTH_MAP
+    global CV_SPLITS, MIN_TRAIN_SIZE_IN_CV, SPLITTER_NAME, GROUP_COUNT
+
+    TRAIN_DF = pd.read_csv(TRAIN_PATH, encoding=ENCODING)
+    TEST_DF = pd.read_csv(TEST_PATH, encoding=ENCODING)
+
+    species_col = infer_species_col(TRAIN_DF)
+
+    if PREPROCESS_DROP_SPECIES and species_col is not None:
+        TRAIN_DF = TRAIN_DF[~TRAIN_DF[species_col].isin(PREPROCESS_DROP_SPECIES)].copy()
+
+    SPECTRAL_COLS = find_wavelength_cols(TRAIN_DF, TEST_DF, species_col)
+    if not SPECTRAL_COLS:
+        SPECTRAL_COLS = fallback_numeric_feature_cols(TRAIN_DF, TEST_DF, species_col)
+        if not SPECTRAL_COLS:
+            raise ValueError("スペクトル列または数値特徴列を特定できませんでした。")
+
+    if PREPROCESS_CLIP_NEGATIVE:
+        TRAIN_DF.loc[:, SPECTRAL_COLS] = TRAIN_DF[SPECTRAL_COLS].clip(lower=0)
+        TEST_DF.loc[:, SPECTRAL_COLS] = TEST_DF[SPECTRAL_COLS].clip(lower=0)
+
+    BAND_MAP, WAVELENGTH_MAP = build_band_map(SPECTRAL_COLS)
+    Y_TRAIN = TRAIN_DF[TARGET_COL].to_numpy(dtype=float)
+
+    CV_SPLITS, SPLITTER_NAME, GROUP_COUNT = build_cv_splits(
+        train_df=TRAIN_DF,
+        y_train=Y_TRAIN,
+        species_col=species_col,
+        cv=CV,
+        cv_strategy=CV_STRATEGY,
+        random_state=RANDOM_STATE,
+    )
+    MIN_TRAIN_SIZE_IN_CV = min_train_size_from_splits(CV_SPLITS)
+
+    print(f"train shape: {TRAIN_DF.shape}")
+    print(f"test shape : {TEST_DF.shape}")
+    print(f"target_col : {TARGET_COL}")
+    print(f"id_col     : {ID_COL}")
+    print(f"species_col: {species_col}")
+    print(f"n_groups   : {GROUP_COUNT}")
+    print(f"cv_strategy: {CV_STRATEGY}")
+    print(f"splitter   : {SPLITTER_NAME}")
+    print(f"n_features : {len(SPECTRAL_COLS)}")
+    print(f"band_names : {list(BAND_MAP.keys())}")
+
+    mlflow.set_tracking_uri(f"file:{MLRUNS_DIR}")
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    with mlflow.start_run(run_name=f"groupkfold_optuna_{DATE}") as run:
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+        )
+        study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=True)
+
+        best_params = suggest_params_from_best_trial(study.best_trial)
+        best_rmse = float(study.best_value)
+        print("best params:", best_params)
+        print(f"best cv rmse: {best_rmse:.6f}")
+
+        best_model, used_cols = build_pipeline(SPECTRAL_COLS, WAVELENGTH_MAP, best_params)
+        best_model.fit(TRAIN_DF, Y_TRAIN)
+        train_pred = best_model.predict(TRAIN_DF)
+        train_pred = np.asarray(train_pred).reshape(-1)
+        train_pred = np.clip(train_pred, 0, None)
+        pred = best_model.predict(TEST_DF)
+        pred = np.asarray(pred).reshape(-1)
+        pred = np.clip(pred, 0, None)
+
+        test_ids = TEST_DF[ID_COL].copy()
+        submit_df = pd.DataFrame({"id": test_ids, "value": pred})
+        rmse_tag = int(round(best_rmse * 10000))
+        submit_path = SUBMIT_DIR / f"submit_csv_{DATE}_{rmse_tag:04d}.csv"
+        submit_df.to_csv(submit_path, index=False, header=False, encoding="utf-8-sig")
+        print(f"saved: {submit_path}")
+
+        trials_df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+        trials_csv_path = SUBMIT_DIR / f"optuna_trials_{DATE}.csv"
+        trials_df.to_csv(trials_csv_path, index=False, encoding="utf-8-sig")
+
+        figure_dir = SUBMIT_DIR / f"figures_{DATE}"
+        figure_paths = create_visualizations(
+            train_df=TRAIN_DF,
+            test_df=TEST_DF,
+            spectral_cols=SPECTRAL_COLS,
+            target_col=TARGET_COL,
+            species_col=species_col,
+            train_pred=train_pred,
+            test_pred=pred,
+            save_dir=figure_dir,
+        )
+
+        best_json_path = SUBMIT_DIR / f"best_params_{DATE}.json"
+        with open(best_json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "best_params": best_params,
+                    "best_cv_rmse": best_rmse,
+                    "n_features": len(used_cols),
+                    "bands_available": list(BAND_MAP.keys()),
+                    "species_col": species_col,
+                    "group_count": GROUP_COUNT,
+                    "cv_strategy": CV_STRATEGY,
+                    "splitter": SPLITTER_NAME,
+                    "figure_dir": str(figure_dir),
+                    "figure_files": [path.name for path in figure_paths],
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        mlflow.log_params(
+            {
+                "target_col": TARGET_COL,
+                "id_col": ID_COL,
+                "species_col": species_col or "",
+                "group_count": GROUP_COUNT,
+                "n_trials": N_TRIALS,
+                "cv": CV,
+                "cv_strategy": CV_STRATEGY,
+                "splitter": SPLITTER_NAME,
+                "random_state": RANDOM_STATE,
+                "feature_count": len(SPECTRAL_COLS),
+                "preprocess_clip_negative": PREPROCESS_CLIP_NEGATIVE,
+                "preprocess_drop_species": ",".join(PREPROCESS_DROP_SPECIES),
+                "best_model_type": best_params["model_type"],
+                "best_preproc": best_params["preproc"],
+                "best_deriv": best_params["deriv"],
+                "best_band_name": best_params["band_name"],
+                "best_sg_window": best_params.get("sg_window", 0),
+                "best_n_components": best_params.get("n_components", 0),
+                "best_alpha": best_params.get("alpha", 0.0),
+            }
+        )
+        mlflow.log_metric("cv_rmse", best_rmse)
+        mlflow.log_artifact(str(submit_path))
+        mlflow.log_artifact(str(trials_csv_path))
+        mlflow.log_artifact(str(best_json_path))
+        if figure_paths:
+            mlflow.log_artifacts(str(figure_dir), artifact_path="figures")
+        mlflow.log_artifact(__file__)
+
+        print(f"mlflow run_id: {run.info.run_id}")
+
+
+
+def suggest_params_from_best_trial(best_trial: optuna.Trial) -> dict:
+    params = {
+        "model_type": best_trial.params["model_type"],
+        "preproc": best_trial.params["preproc"],
+        "deriv": int(best_trial.params["deriv"]),
+        "band_name": best_trial.params["band_name"],
+        "sg_window": int(best_trial.params.get("sg_window", 0)),
+        "n_components": int(best_trial.params.get("n_components", 0)),
+        "alpha": float(best_trial.params.get("alpha", 0.0)),
+    }
+    return params
+
+
+if __name__ == "__main__":
+    main()
+
+# %%
